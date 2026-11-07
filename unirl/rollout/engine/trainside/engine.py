@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import threading
-from typing import List, Optional, Sequence
+from dataclasses import replace
+from typing import ClassVar, Dict, List, Optional, Sequence
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.types.diffusion import DiffusionStage
+from unirl.models.types.per_sample_replay import stamp_sde_index_per_sample
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.sample import Part, Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 class TrainsideRolloutEngine(BaseRolloutEngine):
     """In-process rollout engine: the train actor's Pipeline IS the sampler."""
 
     _component_name = "trainside"
+    supports_per_sample_sde_index: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -29,6 +33,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
     ) -> None:
         self.pipeline = pipeline
         stages = [getattr(pipeline, a) for a in stage_attrs]
+        self.stages = stages
         self.models = [s.trainable_module() for s in stages]
         if forward_batch_size is not None and forward_batch_size < 1:
             raise ValueError(
@@ -78,7 +83,9 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                     fbs = self.forward_batch_size
                     gen = sample.parts[-1]
                     bs = gen.batch_size
-                    if fbs is None or bs <= fbs:
+                    if gen.sde_index_per_sample is not None:
+                        out = self._generate_per_sample_sde(sample)
+                    elif fbs is None or bs <= fbs:
                         out = self.pipeline.generate(sample)
                     else:
                         input_parts = sample.parts[:-1]
@@ -92,6 +99,39 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 for m, mode in zip(self.models, prev_modes):
                     m.train(mode)
             return self._stamp_output_version(out)
+
+    def _generate_per_sample_sde(self, sample: Sample) -> Sample:
+        """Group by SDE step, generate one row at a time, then restore request order; see trainer/README.md."""
+        if self.forward_batch_size != 1:
+            raise ValueError("Per-sample SDE requests require forward_batch_size=1 for FSDP forward lockstep.")
+        if len(self.stages) != 1 or not getattr(self.stages[0], "supports_order_independent_sde_noise", False):
+            raise ValueError(
+                "Per-sample SDE requests require one stage with sample/step-keyed noise; use driver grouping."
+            )
+        gen = sample.parts[-1]
+        params = gen.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise ValueError("Per-sample SDE requests require DiffusionSamplingParams.")
+        positions_by_step: Dict[int, List[int]] = {}
+        for position, step in enumerate(gen.sde_index_per_sample.tolist()):
+            if not 0 <= step < params.num_inference_steps - 1:
+                raise ValueError(
+                    "Per-sample SDE steps must be in [0, num_inference_steps-2]; narrow the scheduler candidate pool."
+                )
+            positions_by_step.setdefault(step, []).append(position)
+        rows: List[Optional[Part]] = [None] * gen.batch_size
+        input_parts = sample.parts[:-1]
+        for step in sorted(positions_by_step):
+            for position in positions_by_step[step]:
+                row = gen.slice(position, position + 1)
+                row.sampling_params = replace(params, sde_indices=[step])
+                chunk = self.pipeline.generate(Sample(parts=[*input_parts, row]))
+                output = chunk.parts[-1]
+                stamp_sde_index_per_sample(
+                    output, step, audio_in_policy=getattr(self.stages[0], "audio_joint_sde", False)
+                )
+                rows[position] = output
+        return Sample(parts=[*input_parts, Part.concat(rows)])
 
     def shutdown(self) -> None:
         with self.lock:

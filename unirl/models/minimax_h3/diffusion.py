@@ -92,6 +92,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
 
     _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
     supports_per_sample_sde_index: ClassVar[bool] = True
+    supports_order_independent_sde_noise: ClassVar[bool] = True
 
     def __init__(
         self,

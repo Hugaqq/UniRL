@@ -36,6 +36,7 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
     params: Any = dc_field(default=None)
     rectification_indices: List[int] = dc_field(default_factory=list)
     batch_normalize_tgr: bool = False
+    engine_per_sample_sde: bool = False
 
 
 class FlashGRPO(FlowGRPO):
@@ -53,6 +54,7 @@ class FlashGRPO(FlowGRPO):
         params: Any,
         rectification_indices: Sequence[int] = (),
         batch_normalize_tgr: bool = False,
+        engine_per_sample_sde: bool = False,
         stage: Any = None,
         pipeline: Any = None,
         stage_attr: str = "diffusion",
@@ -82,6 +84,17 @@ class FlashGRPO(FlowGRPO):
             conditions_cls=conditions_cls,
         )
         self.batch_normalize_tgr = bool(batch_normalize_tgr)
+        if engine_per_sample_sde:
+            if not self.batch_normalize_tgr:
+                raise ValueError(
+                    "FlashGRPO engine_per_sample_sde requires batch_normalize_tgr=true for unequal strata."
+                )
+            if not getattr(self.stage, "supports_order_independent_sde_noise", False):
+                raise ValueError(
+                    "FlashGRPO engine_per_sample_sde requires sample/step-keyed SDE noise; "
+                    f"{type(self.stage).__name__} does not declare it (Wan uses global RNG). "
+                    "Disable engine_per_sample_sde or use a stage with request-local generators."
+                )
         self.backend = backend
         self._batch_tgr_metrics: Dict[str, float] = {}
         if self.batch_normalize_tgr:

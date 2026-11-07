@@ -347,6 +347,20 @@ class DiffusionTrainer(BaseTrainer):
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
         self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
+        self._flash_engine_per_sample_sde = bool(algorithm_cfg.get("engine_per_sample_sde", False))
+        self._flash_audio_in_policy = bool(pipeline_cfg.get("config", {}).get("audio_joint_sde", False))
+        if self._flash_engine_per_sample_sde:
+            if not self._flash_per_sample_sde or not algorithm_cfg.get("batch_normalize_tgr", False):
+                raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
+            if not getattr(rollout_parsed["role_cls"], "supports_per_sample_sde_index", False):
+                raise ValueError(
+                    "engine_per_sample_sde requires a supporting rollout engine (trainside); "
+                    "disable it to retain driver-side grouping on remote engines."
+                )
+            if rollout_cfg.get("forward_batch_size") != 1:
+                raise ValueError(
+                    "engine_per_sample_sde requires rollout.forward_batch_size=1 so FSDP ranks run equal forwards."
+                )
         if algorithm_cfg.get("batch_normalize_tgr", False):
             if stack_cfg.get("num_updates_per_batch", 1) != 1 or accumulate_rollouts != 1:
                 raise ValueError(
@@ -540,7 +554,7 @@ class DiffusionTrainer(BaseTrainer):
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
-        if self._flash_per_sample_sde:
+        if self._flash_per_sample_sde and not self._flash_engine_per_sample_sde:
             strata = len(self._flash_candidate_pool()) * self.rollout.dp_size
             if batch_size % strata:
                 raise ValueError(
@@ -792,8 +806,8 @@ class DiffusionTrainer(BaseTrainer):
                 "rectification_indices, so a mismatch silently mis-scales the loss."
             )
 
-    def _build_flash_request_samples(self, inputs: Sample, rollout_id: int) -> List[Tuple[int, Sample]]:
-        """Stratify one SDE step per prompt; return ``(step, request Sample)`` per step group."""
+    def _flash_prompt_steps(self, inputs: Sample, rollout_id: int) -> List[int]:
+        """Draw one stratified step per root prompt; see README.md for the two dispatch geometries."""
         pool = self._flash_candidate_pool()
         # ``Sample.select`` indexes this same list, which groups by root id, so a
         # duplicate or empty root id set would collapse the batch onto one request.
@@ -805,13 +819,16 @@ class DiffusionTrainer(BaseTrainer):
                 f"{n_prompts} root groups for {root_rows} root rows, so the per-prompt SDE "
                 "draw cannot address the batch."
             )
-        # One generate call per step group is DP-scattered, and the handle rejects a
-        # call whose root-prompt count is not a multiple of the rollout's dp_size, so
-        # each step must own a whole number of DP shards. Equal counts per step is also
-        # what Flash-GRPO's stratified assignment asks for. See README.md here.
+        # Driver groups require equal DP-divisible strata; engine groups need only equal DP shards.
         dp_size = self.rollout.dp_size
         pool_size = len(pool)
-        if n_prompts % (pool_size * dp_size):
+        if self._flash_engine_per_sample_sde:
+            if not n_prompts or n_prompts % dp_size:
+                raise ValueError(
+                    f"FlashGRPO engine_per_sample_sde requires a positive batch_size divisible by rollout dp_size={dp_size}; "
+                    f"got {n_prompts}. Resize batch_size."
+                )
+        elif n_prompts % (pool_size * dp_size):
             raise ValueError(
                 f"FlashGRPO stratifies {n_prompts} prompts across the {pool_size}-step SDE candidate "
                 f"pool, so batch_size must be a multiple of pool_size * rollout dp_size = "
@@ -819,14 +836,26 @@ class DiffusionTrainer(BaseTrainer):
                 "timestep_fraction, or resize batch_size."
             )
         rng = np.random.default_rng(rollout_id)
-        # Prompt ``i`` joins stratum ``i % pool_size``, so each step owns exactly
-        # n_prompts / pool_size prompts and the whole pool is covered every rollout.
+        # Keep the permutation and position modulo identical in both dispatch modes.
         order = rng.permutation(pool_size)
         steps = [pool[int(s)] for s in order]
 
+        return [steps[position % pool_size] for position in range(n_prompts)]
+
+    def _build_flash_engine_request(self, inputs: Sample, rollout_id: int) -> Sample:
+        """Keep prompt order and carry the stratified draw as a CONCAT request field."""
+        steps = self._flash_prompt_steps(inputs, rollout_id)
+        request = self._build_request_sample(inputs, rollout_id, sde_index_override=steps[0])
+        request.parts[-1].sde_index_per_sample = torch.tensor(steps, dtype=torch.long).repeat_interleave(
+            total_samples_per_prompt(self.sampling_params)
+        )
+        return request
+
+    def _build_flash_request_samples(self, inputs: Sample, rollout_id: int) -> List[Tuple[int, Sample]]:
+        """Stratify one SDE step per prompt; return ``(step, request Sample)`` per step group."""
         positions_by_step: Dict[int, List[int]] = {}
-        for position in range(n_prompts):
-            positions_by_step.setdefault(steps[position % pool_size], []).append(position)
+        for position, step in enumerate(self._flash_prompt_steps(inputs, rollout_id)):
+            positions_by_step.setdefault(step, []).append(position)
 
         return [
             (
@@ -842,7 +871,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        stamp_sde_index_per_sample(sample.parts[-1], sde_index)
+        stamp_sde_index_per_sample(sample.parts[-1], sde_index, audio_in_policy=self._flash_audio_in_policy)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
@@ -1046,7 +1075,10 @@ class DiffusionTrainer(BaseTrainer):
             # FlashGRPO fans the rollout into one generate per SDE-step group so a
             # single optimizer step averages over a spread of sigmas; every other
             # algorithm builds one request.
-            if self._flash_per_sample_sde:
+            if self._flash_engine_per_sample_sde:
+                request_samples = [self._build_flash_engine_request(inputs, rollout_id)]
+                group_steps = None
+            elif self._flash_per_sample_sde:
                 groups = self._build_flash_request_samples(inputs, rollout_id)
                 request_samples = [item for _, item in groups]
                 group_steps: Optional[List[int]] = [step for step, _ in groups]

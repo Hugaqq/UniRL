@@ -497,18 +497,33 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
-- **FlashGRPO assigns one SDE step per prompt, by stratification.** `requires_per_sample_sde_index`
+- **By default, FlashGRPO groups requests on the driver.** `requires_per_sample_sde_index`
   makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group,
   stamp `segment.sde_index_per_sample`, and concatenate the groups into one track *inside a single
   residency window*. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
   prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
   whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
-- **The FlashGRPO batch must satisfy `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
+- **Driver-grouped FlashGRPO requires `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
   group is one DP-scattered `generate`, and the handle rejects a call whose root-prompt count is not
   a multiple of `dp_size`; equal counts per step (stratification) then forces the product to divide
   the batch. At `batch_size=48` with `dp_size=8` the candidate pool can hold at most 6 steps, so the
   scheduler's `timestep_fraction` must be narrowed to match. The trainer checks this at startup, once
   the rollout is built, rather than letting a group of 1-5 prompts reach the handle.
+- **`algorithm.engine_per_sample_sde: true` moves grouping into trainside.** It defaults to
+  `false` and requires `algorithm.batch_normalize_tgr: true`, a capable engine, and
+  `rollout.forward_batch_size: 1`. The driver uses the same rollout-id permutation and
+  `position % pool_size` prompt assignment, but sends one request with CONCAT
+  `Part.sde_index_per_sample`. Each rank groups locally, generates every row separately,
+  stamps both latent streams with the shared helper, and restores original row order.
+  Only `batch_size % rollout.dp_size == 0` remains; reward/train geometry checks still apply.
+  Equal row counts and fixed denoising lengths preserve FSDP forward/collective counts even
+  if ranks visit different steps. Remote engines keep driver grouping unless explicitly
+  requested, in which case unsupported engines fail rather than falling back.
+- **Engine grouping requires sample/step-keyed noise.** H3 declares
+  `supports_order_independent_sde_noise` because its pipeline passes sample ids to both
+  stream generators. Wan does not declare it and is rejected at algorithm construction:
+  regrouping its global RNG draws would change trajectories. The engine checks this again
+  for directly supplied per-sample requests.
 - **The FlashGRPO groups merge before advantages.** The concatenation must happen before
   `compute_advantages`, because advantage normalization is batch-wide over the merged track. Each
   prompt's own rollouts already share one step, so the merged track still compares like with like.
@@ -518,7 +533,8 @@ without driver-authored x_T. `media_log_interval` does not apply
   collapse the whole batch onto one request and one sigma. The trainer compares the two counts
   and raises instead.
 - **A merged FlashGRPO track's shared fields are not per-sample truth.** `_stamp_sde_index_per_sample`
-  rewrites each step group's `segment.latents` to fixed `[before, after, final]` slots, normalizes
+  delegates to `models.types.per_sample_replay.stamp_sde_index_per_sample`, which packs both
+  `segment.latents` and `segment.aux_latents` into `[before, after, final]` slots, normalizes
   `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
   `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
   the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
