@@ -91,6 +91,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
     """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``."""
 
     _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
+    supports_per_sample_sde_index: ClassVar[bool] = True
 
     def __init__(
         self,

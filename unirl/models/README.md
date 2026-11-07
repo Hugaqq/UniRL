@@ -89,6 +89,15 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 
 ## Gotchas
 
+- **Per-sample A/V replay reads fixed slots, not the shared step map.**
+  `stamp_sde_index_per_sample` packs video and audio into `[before, after, final]`
+  before replacing `indices`. After group concat, only `sde_index_per_sample`
+  identifies each row's transition. `replay_joint_av_steps` indexes each stream's
+  own schedule at that step and the next; `sigma_max` is that schedule's second
+  point, matching single-stream replay and Flash's upstream coefficient. Both
+  strategies must receive `init_schedule` so their terminal sigma is preserved.
+  The per-sample branch returns separate fp32 means and transition stds in
+  `ReplayResult`; the shared-step path leaves these optional fields unset.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the
   model via `getattr(bundle, trainable_attr)`; engines via
   `getattr(pipeline, stage_attr).trainable_module()`. Keep both pointing at the same

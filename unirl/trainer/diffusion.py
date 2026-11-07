@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.models.types.per_sample_replay import stamp_sde_index_per_sample
 from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
@@ -22,7 +23,7 @@ from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
-from unirl.types.sampling import BaseSamplingParams, DiffusionSamplingParams, total_samples_per_prompt
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -833,21 +834,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        frontier = sample.parts[-1]
-        segment = frontier.segment
-        if segment is None:
-            raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
-        segment.sde_index_per_sample = torch.full((frontier.batch_size,), sde_index, dtype=torch.long)
-        if segment.indices is not None and segment.latents is not None:
-            before = segment.latents_at(sde_index)
-            after = segment.latents_at(sde_index + 1)
-            final = segment.latents[:, -1]
-            segment.latents = torch.stack([before, after, final], dim=1)
-            segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
-        if segment.sde_indices is not None:
-            segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
-        if isinstance(frontier.sampling_params, DiffusionSamplingParams):
-            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
+        stamp_sde_index_per_sample(sample.parts[-1], sde_index)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""

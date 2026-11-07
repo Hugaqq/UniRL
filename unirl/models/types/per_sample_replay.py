@@ -3,14 +3,41 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 
 from unirl.models.types.replay_result import ReplayResult
+from unirl.types.sampling import DiffusionSamplingParams
 
 if TYPE_CHECKING:
+    from unirl.types.sample import Part
     from unirl.types.segments.latent import LatentSegment
+
+
+def stamp_sde_index_per_sample(part: "Part", sde_index: int, *, audio_in_policy: bool = False) -> None:
+    """Normalize both streams to [before, after, final]; see models/README.md Gotchas."""
+    segment = part.segment
+    if segment is None:
+        raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
+    if audio_in_policy and segment.aux_latents is None:
+        raise ValueError("FlashGRPO: audio_in_policy requires aux_latents; enable audio trajectory storage in rollout.")
+    segment.sde_index_per_sample = torch.full((part.batch_size,), sde_index, dtype=torch.long)
+    if segment.indices is not None and segment.latents is not None:
+        before = segment.latents_at(sde_index)
+        after = segment.latents_at(sde_index + 1)
+        final = segment.latents[:, -1]
+        if segment.aux_latents is not None:
+            audio_before = segment.aux_latents_at(sde_index)
+            audio_after = segment.aux_latents_at(sde_index + 1)
+            segment.aux_latents = torch.stack([audio_before, audio_after, segment.aux_latents[:, -1]], dim=1)
+        segment.latents = torch.stack([before, after, final], dim=1)
+        segment.indices = torch.arange(3, dtype=torch.long, device=segment.indices.device)
+    if segment.sde_indices is not None:
+        segment.sde_indices = torch.zeros(1, dtype=torch.long, device=segment.sde_indices.device)
+    if isinstance(part.sampling_params, DiffusionSamplingParams):
+        part.sampling_params = replace(part.sampling_params, sde_indices=None)
 
 
 class PerSampleStepReplayMixin:
@@ -94,4 +121,4 @@ class PerSampleStepReplayMixin:
         return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
 
 
-__all__ = ["PerSampleStepReplayMixin"]
+__all__ = ["PerSampleStepReplayMixin", "stamp_sde_index_per_sample"]
