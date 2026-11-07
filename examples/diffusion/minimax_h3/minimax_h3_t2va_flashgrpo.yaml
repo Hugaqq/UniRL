@@ -47,15 +47,18 @@ backend:
   fsdp_cfg:
     _target_: unirl.train.configs.FSDPConfig
     param_dtype: bf16
+    # bf16 masters can round small Adam updates to zero.
     master_dtype: fp32
     expandable_segments: true
     cpu_offload: false
     mixed_precision: true
+    # Timestep embeddings remain fp32 until each block's bf16 AdaLN projection.
     cast_forward_inputs: false
     fsdp_mode: full
     reshard_after_forward: true
     activation_checkpointing: true
     use_torch_compile: false
+    # Patch projections, timestep MLP, output heads, and rope stay outside FSDP groups at checkpoint precision.
     root_wrap: false
   optimizer_cfg:
     _target_: unirl.train.backend.base.OptimizerConfig
@@ -76,6 +79,7 @@ backend:
     dropout: 0.0
     bias: none
     task_type: FEATURE_EXTRACTION
+    # These LoRA suffixes also occur in token_refiner, outside the DP-synchronized transformer blocks.
     module_prefix: transformer_blocks
     target_modules:
       - attn.to_q
@@ -100,6 +104,7 @@ reward:
       weights:
         imagebind: 1.0
         clap: 1.0
+      # ImageBind mode=all scores text-video, text-audio, and audio-video; CLAP scores text-audio.
       scorers:
         imagebind:
           _target_: unirl.reward.local.imagebind.ImageBindRewardScorer
@@ -107,6 +112,7 @@ reward:
           config:
             _target_: unirl.reward.local.imagebind.ImageBindSpec
             batch_size: 2
+            # audio_video alone has no prompt-video alignment term.
             mode: all
         clap:
           _target_: unirl.reward.local.clap.CLAPRewardScorer
@@ -148,9 +154,11 @@ sampling:
     _target_: unirl.sde.index_schedule.AllSDEScheduler
     num_timesteps: ${sampling.num_inference_steps}
     timestep_fraction: [0.0, 0.5]
+    # Training draws per prompt from the pool; this count controls eval_eta > 0 evaluation.
     num_sde_steps: 1
   height: 256
   width: 384
+  # H3's 17n+5 frame geometry and 5 s minimum make 124 the smallest legal frame count.
   num_frames: 124
   eta: 1.0
   samples_per_prompt: 16
