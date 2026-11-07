@@ -168,11 +168,19 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
-- **`FlashGRPO`'s `rectification_indices` is a normalizer, not a target list.** Upstream
-  normalizes each step's coefficient by the mean over the gradient-accumulation window; UniRL's
-  rollout records one step, so the recipe supplies the candidate pool instead. Normalizing by
-  the trained steps alone collapses every weight to ~1, which is the zero-diversity failure the
-  per-sample path exists to fix, so the per-sample path *requires* the field and raises without it.
+- **By default, `FlashGRPO.rectification_indices` is a required pool normalizer, not a target list.**
+  Each sample's coefficient is divided by the candidate-pool mean, which equals the actual
+  batch mean only with equal step counts. `batch_normalize_tgr: true` instead normalizes the
+  complete arranged batch in `prepare_part`, before micro slicing. Its single unconditional
+  `backend.all_reduce_loss_sums` reduces fp64 sum/count, invalid-rank flags, and step counts
+  over the gradient mesh. Invalid data makes every rank fail after the collective.
+  Equal global step counts retain the old fp32 pool-mean rounding for bit identity; unequal
+  counts use the global sum/count. Counts also select the global weight extrema for
+  `flash_tgr_global_mean/min/max` metrics, without a second collective.
+  Detached `part.segment.flash_tgr_weights` travels with concat/select/slice; loss never
+  renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
+  after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
+  Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
 - **`FlashGRPO` runs only the per-sample path, with `beta: 0`.** It raises at construction on
   `beta > 0` (a KL against one group's means would be wrong) or a non-`FlashSDEStrategy` stage, and
   at the first step on a segment without `sde_index_per_sample`, which means the trainer never

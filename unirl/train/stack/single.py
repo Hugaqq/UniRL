@@ -240,6 +240,8 @@ class TrainStack(BaseTrainStack):
         window = parts if isinstance(parts, tuple) else (parts,)
         if not window:
             raise ValueError(f"{type(self).__name__}.train_track: empty accumulation window.")
+        if len(window) > 1 and getattr(self.algorithm, "batch_normalize_tgr", False):
+            raise ValueError("FlashGRPO batch_normalize_tgr requires accumulate_rollouts=1; pass one rollout part.")
         if len(window) > 1 and self.num_updates_per_batch > 1:
             raise ValueError(
                 f"{type(self).__name__}.train_track: an accumulation window of {len(window)} parts "

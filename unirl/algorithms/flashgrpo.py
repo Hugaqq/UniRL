@@ -8,8 +8,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Type, Union
 
 import torch
 
+from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.sde.kernels import FlashSDEStrategy
 from unirl.types.conditions import Condition
+from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
 
 from .base import (
@@ -33,6 +35,7 @@ class FlashGRPOConfig(BaseAlgorithmConfig):
     adv_clip_max: float = 5.0
     params: Any = dc_field(default=None)
     rectification_indices: List[int] = dc_field(default_factory=list)
+    batch_normalize_tgr: bool = False
 
 
 class FlashGRPO(FlowGRPO):
@@ -48,7 +51,8 @@ class FlashGRPO(FlowGRPO):
         self,
         *,
         params: Any,
-        rectification_indices: Sequence[int],
+        rectification_indices: Sequence[int] = (),
+        batch_normalize_tgr: bool = False,
         stage: Any = None,
         pipeline: Any = None,
         stage_attr: str = "diffusion",
@@ -77,6 +81,21 @@ class FlashGRPO(FlowGRPO):
             backend=backend,
             conditions_cls=conditions_cls,
         )
+        self.batch_normalize_tgr = bool(batch_normalize_tgr)
+        self.backend = backend
+        self._batch_tgr_metrics: Dict[str, float] = {}
+        if self.batch_normalize_tgr:
+            if not isinstance(params.scheduler, AllSDEScheduler):
+                raise ValueError("FlashGRPO batch_normalize_tgr requires params.scheduler=AllSDEScheduler.")
+            pool = params.scheduler.sde_candidate_pool()
+            if not pool or max(pool) >= params.num_inference_steps - 1:
+                raise ValueError("FlashGRPO: choose a nonempty candidate pool excluding the final denoising step.")
+            if rectification_indices and sorted(rectification_indices) != sorted(pool):
+                raise ValueError("FlashGRPO: omit rectification_indices or set it to the scheduler candidate pool.")
+            rectification_indices = pool
+            self.supports_multi_update = False
+            if backend is None:
+                raise ValueError("FlashGRPO batch_normalize_tgr requires the training backend, including on one rank.")
         if not rectification_indices:
             raise ValueError(
                 "FlashGRPO per-sample rectification requires rectification_indices (the shared "
@@ -100,6 +119,61 @@ class FlashGRPO(FlowGRPO):
             raise ValueError(
                 f"FlashGRPO requires the stage strategy to be FlashSDEStrategy; got {type(strategy).__name__}."
             )
+
+    def prepare_part(self, part: Part) -> Part:
+        """Attach detached [B, 1] weights before micro slicing; see algorithms/README.md Gotchas."""
+        if not self.batch_normalize_tgr:
+            return part
+        pool = self.rectification_indices
+        statistics = [0.0] * (3 + len(pool))
+        error = None
+        try:
+            segment = part.segment
+            if segment is None or segment.sigmas is None or segment.sde_index_per_sample is None:
+                raise ValueError("missing segment.sigmas or segment.sde_index_per_sample")
+            idx = segment.sde_index_per_sample
+            if idx.ndim != 1 or idx.dtype not in (torch.int32, torch.int64) or idx.numel() != part.batch_size:
+                raise ValueError("sde_index_per_sample must be a 1-D integer tensor with one step per sample")
+            sigmas = segment.sigmas.to(dtype=torch.float32)
+            if sigmas.ndim != 1 or not torch.isfinite(sigmas).all():
+                raise ValueError("sigmas must be a finite 1-D schedule")
+            device = sigmas.device
+            candidates = torch.tensor(pool, device=device, dtype=torch.long)
+            matches = idx.to(device=device)[:, None] == candidates[None, :]
+            if not matches.any(dim=1).all():
+                raise ValueError(f"each sample's SDE step must belong to candidate pool {pool}")
+            self.stage.strategy.init_schedule(sigmas)
+            coefficients = self._rectification_coefficients(sigmas=sigmas, steps=pool, device=device).detach()
+            if not (torch.isfinite(coefficients) & (coefficients > 0)).all():
+                raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
+            weights = coefficients[matches.long().argmax(dim=1)]
+            statistics = [weights.double().sum().item(), float(weights.numel()), 0.0, *matches.sum(dim=0).tolist()]
+        except (ValueError, RuntimeError, IndexError) as exc:
+            error = str(exc)
+            statistics[2] = 1.0
+        total, count, invalid, *counts = self.backend.all_reduce_loss_sums(statistics)
+        if invalid:
+            raise ValueError(
+                "FlashGRPO batch_normalize_tgr: invalid input on a training rank; "
+                f"{error or 'check the failing rank for its schedule/step error'}. Fix the rollout schedule and step pool."
+            )
+        if count <= 0 or not torch.isfinite(torch.tensor(total / count)) or total <= 0:
+            raise ValueError("FlashGRPO batch_normalize_tgr: global coefficient sum/count must be finite and positive.")
+        norm = coefficients.mean() if len(set(counts)) == 1 else coefficients.new_tensor(total / count)
+        pool_weights = coefficients / norm
+        if not (torch.isfinite(pool_weights) & (pool_weights > 0)).all():
+            raise ValueError(
+                "FlashGRPO batch_normalize_tgr: normalized weights must be finite and positive; check sigmas."
+            )
+        segment.flash_tgr_weights = (weights / norm).reshape(-1, 1).detach()
+        global_counts = torch.tensor(counts, dtype=torch.float64, device=device)
+        active = pool_weights[global_counts > 0]
+        self._batch_tgr_metrics = {
+            "flash_tgr_global_mean": (pool_weights.double() * global_counts).sum().item() / count,
+            "flash_tgr_global_min": active.min().item(),
+            "flash_tgr_global_max": active.max().item(),
+        }
+        return part
 
     def compute_loss_and_backward(
         self,
@@ -142,7 +216,12 @@ class FlashGRPO(FlowGRPO):
             clip_range=clip_range,
         )
 
-        tgr = self._rectification_weights_per_sample(segment=segment, device=new_logp.device)
+        if self.batch_normalize_tgr:
+            if segment.flash_tgr_weights is None:
+                raise ValueError("FlashGRPO batch_normalize_tgr requires prepare_part before micro-batch slicing.")
+            tgr = segment.flash_tgr_weights.to(device=new_logp.device)
+        else:
+            tgr = self._rectification_weights_per_sample(segment=segment, device=new_logp.device)
         tgr = tgr.to(dtype=loss_per_elem.dtype)
         loss_per_elem = loss_per_elem * tgr
         loss = loss_per_elem.mean()
@@ -160,6 +239,8 @@ class FlashGRPO(FlowGRPO):
         metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
         metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
         metrics["clip_range"] = clip_range
+        if self.batch_normalize_tgr:
+            metrics.update(self._batch_tgr_metrics)
 
         return AlgorithmStepResult(
             loss=metrics["policy_loss"],

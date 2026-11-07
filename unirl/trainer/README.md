@@ -527,7 +527,11 @@ without driver-authored x_T. `media_log_interval` does not apply
   latents where earlier steps store three, and `torch.cat` cannot merge different `K`. The trainer
   raises at build time rather than failing mid-rollout. Keep the scheduler's `timestep_fraction` end
   below `(num_inference_steps - 1) / num_inference_steps`.
-- **`rectification_indices` must equal the scheduler's candidate pool.** The per-sample rectification
+- **An explicit `rectification_indices` must equal the scheduler's candidate pool.** With
+  `algorithm.batch_normalize_tgr: true` it may be omitted: weights use the actual global
+  batch in `prepare_part`, and each row's step must belong to the scheduler pool. This mode
+  requires `stack.num_updates_per_batch=1` and `accumulate_rollouts=1`.
+  In the default pool-normalized mode, the per-sample rectification
   weight normalizes each sample's coefficient by the mean over `rectification_indices` while the step
   itself is drawn from `sde_candidate_pool()`; the two live in different config blocks, and a mismatch
   silently rescales the loss. The trainer fails fast instead.

@@ -347,6 +347,12 @@ class DiffusionTrainer(BaseTrainer):
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
         self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
+        if algorithm_cfg.get("batch_normalize_tgr", False):
+            if stack_cfg.get("num_updates_per_batch", 1) != 1 or accumulate_rollouts != 1:
+                raise ValueError(
+                    "FlashGRPO batch_normalize_tgr normalizes one rollout/update; set "
+                    "stack.num_updates_per_batch=1 and accumulate_rollouts=1."
+                )
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
         self.eval_interval = eval_interval
@@ -771,6 +777,8 @@ class DiffusionTrainer(BaseTrainer):
     def _check_flash_rectification_pool(self, algorithm_cfg: Any) -> None:
         """Fail fast when the rectification normalizer disagrees with the SDE candidate pool."""
         pool = sorted(self._flash_candidate_pool())
+        if algorithm_cfg.get("batch_normalize_tgr", False) and not algorithm_cfg.get("rectification_indices"):
+            return
         if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
             raise ValueError(
                 "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
