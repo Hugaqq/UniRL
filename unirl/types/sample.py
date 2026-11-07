@@ -114,7 +114,7 @@ class Part(Batch):
 
         if self.sde_index_per_sample is not None:
             steps = self.sde_index_per_sample
-            if steps.ndim != 1 or steps.dtype not in (torch.int32, torch.int64) or steps.numel() != expected_batch:
+            if steps.shape != (expected_batch,) or steps.dtype not in (torch.int32, torch.int64):
                 raise ValueError("Part.sde_index_per_sample must be a 1-D integer tensor aligned with sample_ids.")
 
     @classmethod

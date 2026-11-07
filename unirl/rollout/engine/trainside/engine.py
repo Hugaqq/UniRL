@@ -130,6 +130,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 stamp_sde_index_per_sample(
                     output, step, audio_in_policy=getattr(self.stages[0], "audio_joint_sde", False)
                 )
+                output.sde_index_per_sample = None
                 rows[position] = output
         return Sample(parts=[*input_parts, Part.concat(rows)])
 

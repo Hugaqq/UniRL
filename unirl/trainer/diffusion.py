@@ -846,8 +846,9 @@ class DiffusionTrainer(BaseTrainer):
         """Keep prompt order and carry the stratified draw as a CONCAT request field."""
         steps = self._flash_prompt_steps(inputs, rollout_id)
         request = self._build_request_sample(inputs, rollout_id, sde_index_override=steps[0])
-        request.parts[-1].sde_index_per_sample = torch.tensor(steps, dtype=torch.long).repeat_interleave(
-            total_samples_per_prompt(self.sampling_params)
+        steps_by_root = dict(zip(request.parts[0].sample_ids, steps))
+        request.parts[-1].sde_index_per_sample = torch.tensor(
+            [steps_by_root[root_id] for root_id in request.root_group_ids(-1)], dtype=torch.long
         )
         return request
 

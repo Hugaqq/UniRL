@@ -513,8 +513,10 @@ without driver-authored x_T. `media_log_interval` does not apply
   `false` and requires `algorithm.batch_normalize_tgr: true`, a capable engine, and
   `rollout.forward_batch_size: 1`. The driver uses the same rollout-id permutation and
   `position % pool_size` prompt assignment, but sends one request with CONCAT
-  `Part.sde_index_per_sample`. Each rank groups locally, generates every row separately,
-  stamps both latent streams with the shared helper, and restores original row order.
+  `Part.sde_index_per_sample`, mapped by root id to the actual frontier row order.
+  Each rank groups locally, generates every row separately, stamps both latent streams
+  with the shared helper, and restores original row order. After stamping, the engine
+  clears the Part's request-only field; `segment.sde_index_per_sample` is the output authority.
   Only `batch_size % rollout.dp_size == 0` remains; reward/train geometry checks still apply.
   Equal row counts and fixed denoising lengths preserve FSDP forward/collective counts even
   if ranks visit different steps. Remote engines keep driver grouping unless explicitly
