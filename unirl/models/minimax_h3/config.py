@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -108,6 +109,10 @@ class MiniMaxH3PipelineConfig:
 
     def __post_init__(self) -> None:
         validate_precision_type(self.model_precision, field="MiniMaxH3PipelineConfig.model_precision")
+        for name in ("video_shift", "audio_shift"):
+            shift = getattr(self, name)
+            if not math.isfinite(shift) or shift <= 0:
+                raise ValueError(f"MiniMaxH3PipelineConfig.{name} must be finite and > 0; got {shift!r}.")
 
 
 __all__ = [

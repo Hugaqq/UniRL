@@ -348,7 +348,6 @@ class DiffusionTrainer(BaseTrainer):
         self._uses_ema = algo_cls.requires_ema_rollout
         self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
         self._flash_engine_per_sample_sde = bool(algorithm_cfg.get("engine_per_sample_sde", False))
-        self._flash_audio_in_policy = bool(pipeline_cfg.get("config", {}).get("audio_joint_sde", False))
         if self._flash_engine_per_sample_sde:
             if not self._flash_per_sample_sde or not algorithm_cfg.get("batch_normalize_tgr", False):
                 raise ValueError("engine_per_sample_sde requires FlashGRPO with algorithm.batch_normalize_tgr=true.")
@@ -872,7 +871,7 @@ class DiffusionTrainer(BaseTrainer):
 
     def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
-        stamp_sde_index_per_sample(sample.parts[-1], sde_index, audio_in_policy=self._flash_audio_in_policy)
+        stamp_sde_index_per_sample(sample.parts[-1], sde_index)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""

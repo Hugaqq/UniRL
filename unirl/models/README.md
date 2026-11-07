@@ -94,8 +94,9 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   before replacing `indices`. After group concat, only `sde_index_per_sample`
   identifies each row's transition. `replay_joint_av_steps` indexes each stream's
   own schedule at that step and the next; `sigma_max` is that schedule's second
-  point, matching single-stream replay and Flash's upstream coefficient. Both
-  strategies must receive `init_schedule` so their terminal sigma is preserved.
+  point, matching single-stream replay and Flash's upstream coefficient. Callers
+  initialize both strategies with their schedules before joint replay so each
+  terminal sigma is preserved; H3 does this in `MiniMaxH3DiffusionStage.replay`.
   The per-sample branch returns separate fp32 means and transition stds in
   `ReplayResult`; the shared-step path leaves these optional fields unset.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the

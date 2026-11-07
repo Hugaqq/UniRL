@@ -188,9 +188,6 @@ class BatchedStepReplayMixin:
         a_sigma_max = sigma_max if audio_sigmas is None else a_sigmas[1].float()
         if per_sample:
             a_sigmas = a_sigmas.to(device=device, dtype=torch.float32)
-            self.strategy.init_schedule(sigmas)
-            if a_strat is not self.strategy:
-                a_strat.init_schedule(a_sigmas)
         groups = (
             [target]
             if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy)
@@ -302,11 +299,6 @@ class BatchedStepReplayMixin:
                     if audio_in_policy
                     else None
                 )
-                for std in (video_std, audio_std):
-                    if std is not None and not (torch.isfinite(std) & (std > 0)).all():
-                        raise ValueError(
-                            f"{owner}.replay: transition std must be finite and positive; check sigmas and eta."
-                        )
                 return ReplayResult(
                     log_probs=log_prob_all.reshape(B, 1).to(dtype=self.logprob_dtype),
                     prev_sample_means=prev_mean_all.unsqueeze(1),

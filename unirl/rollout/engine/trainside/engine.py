@@ -127,9 +127,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 row.sampling_params = replace(params, sde_indices=[step])
                 chunk = self.pipeline.generate(Sample(parts=[*input_parts, row]))
                 output = chunk.parts[-1]
-                stamp_sde_index_per_sample(
-                    output, step, audio_in_policy=getattr(self.stages[0], "audio_joint_sde", False)
-                )
+                stamp_sde_index_per_sample(output, step)
                 output.sde_index_per_sample = None
                 rows[position] = output
         return Sample(parts=[*input_parts, Part.concat(rows)])
