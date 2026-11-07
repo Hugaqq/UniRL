@@ -174,8 +174,10 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   complete arranged batch in `prepare_part`, before micro slicing. Its single unconditional
   `backend.all_reduce_loss_sums` reduces fp64 sum/count, invalid-rank flags, and step counts
   over the gradient mesh. Invalid data makes every rank fail after the collective.
-  Equal global step counts retain the old fp32 pool-mean rounding for bit identity; unequal
-  counts use the global sum/count. Counts also select the global weight extrema for
+  Equal global step counts retain the explicit pool order, fp32 mean, and epsilon clamp
+  for bit identity with the same legacy configuration; unequal counts use the global
+  sum/count. The clamp can leave the actual mean below one, which the metrics report
+  without adjustment. Counts also select the global weight extrema for
   `flash_tgr_global_mean/min/max` metrics, without a second collective.
   Detached `part.segment.flash_tgr_weights` travels with concat/select/slice; loss never
   renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights

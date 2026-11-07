@@ -105,7 +105,8 @@ class FlashGRPO(FlowGRPO):
                 raise ValueError("FlashGRPO: choose a nonempty candidate pool excluding the final denoising step.")
             if rectification_indices and sorted(rectification_indices) != sorted(pool):
                 raise ValueError("FlashGRPO: omit rectification_indices or set it to the scheduler candidate pool.")
-            rectification_indices = pool
+            if not rectification_indices:
+                rectification_indices = pool
             self.supports_multi_update = False
             if backend is None:
                 raise ValueError("FlashGRPO batch_normalize_tgr requires the training backend, including on one rank.")
@@ -150,6 +151,8 @@ class FlashGRPO(FlowGRPO):
             sigmas = segment.sigmas.to(dtype=torch.float32)
             if sigmas.ndim != 1 or not torch.isfinite(sigmas).all():
                 raise ValueError("sigmas must be a finite 1-D schedule")
+            if sigmas.shape[0] < 2 or min(pool) < 0 or max(pool) >= sigmas.shape[0] - 1:
+                raise ValueError("sigmas must cover every candidate step and its successor; fix the rollout schedule")
             device = sigmas.device
             candidates = torch.tensor(pool, device=device, dtype=torch.long)
             matches = idx.to(device=device)[:, None] == candidates[None, :]
@@ -161,18 +164,22 @@ class FlashGRPO(FlowGRPO):
                 raise ValueError("TGR coefficients must be finite and positive; check sigmas and eta")
             weights = coefficients[matches.long().argmax(dim=1)]
             statistics = [weights.double().sum().item(), float(weights.numel()), 0.0, *matches.sum(dim=0).tolist()]
-        except (ValueError, RuntimeError, IndexError) as exc:
-            error = str(exc)
+        except ValueError as exc:
+            error = exc
             statistics[2] = 1.0
         total, count, invalid, *counts = self.backend.all_reduce_loss_sums(statistics)
         if invalid:
             raise ValueError(
                 "FlashGRPO batch_normalize_tgr: invalid input on a training rank; "
                 f"{error or 'check the failing rank for its schedule/step error'}. Fix the rollout schedule and step pool."
-            )
+            ) from error
         if count <= 0 or not torch.isfinite(torch.tensor(total / count)) or total <= 0:
             raise ValueError("FlashGRPO batch_normalize_tgr: global coefficient sum/count must be finite and positive.")
-        norm = coefficients.mean() if len(set(counts)) == 1 else coefficients.new_tensor(total / count)
+        norm = (
+            coefficients.detach().mean().clamp_min(torch.finfo(torch.float32).eps)
+            if len(set(counts)) == 1
+            else coefficients.new_tensor(total / count)
+        )
         pool_weights = coefficients / norm
         if not (torch.isfinite(pool_weights) & (pool_weights > 0)).all():
             raise ValueError(
